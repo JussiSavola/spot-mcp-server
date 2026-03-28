@@ -3,13 +3,17 @@ spot-hinta MCP server
 Fetches Finnish electricity spot prices from api.spot-hinta.fi
 and serves them via FastMCP (Streamable HTTP transport).
 
-Endpoints used:
-  GET /JustNow        -> current quarter-hour: Rank, DateTime, PriceNoTax, PriceWithTax
-  GET /Today          -> all 96 quarter-hour slots for today (same fields)
+Endpoint used:
+  GET /TodayAndDayForward  -> all available slots for today and, if published, tomorrow
 
 Cache strategy:
-  - JustNow: cached for 60 seconds
-  - Today:   cached until next quarter-hour boundary (refreshed at :00, :15, :30, :45)
+  - A single /TodayAndDayForward call populates all data.
+  - Prices are static once published; cache expires only when new data can appear:
+      * Tomorrow's data present  -> expire at midnight after tomorrow
+      * Only today, time < 14:15 -> expire at midnight tonight
+      * Only today, time >= 14:15 -> expire in 15 min (lazy poll until tomorrow published)
+  - Current price is derived from cache by matching the current quarter-hour slot.
+    No /JustNow calls are made.
 
 Run:
   python spot_hinta_mcp.py
@@ -18,11 +22,11 @@ Default port: 8765  (set env SPOT_HINTA_PORT to override)
 MCP endpoint: http://localhost:8765/mcp  (Streamable HTTP)
 """
 
-import asyncio
 import os
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastmcp import FastMCP
@@ -33,32 +37,66 @@ from fastmcp import FastMCP
 
 BASE_URL = "https://api.spot-hinta.fi"
 PORT = int(os.environ.get("SPOT_HINTA_PORT", 8765))
+FINNISH_TZ = ZoneInfo("Europe/Helsinki")
+
+# Tomorrow's prices are published around 14:15, at latest ~16:00
+TOMORROW_POLL_AFTER_HOUR = 14
+TOMORROW_POLL_INTERVAL_S = 15 * 60  # re-check every 15 min after 14:xx
 
 # ---------------------------------------------------------------------------
-# Simple in-memory cache
+# Price cache
 # ---------------------------------------------------------------------------
 
-class Cache:
+class PriceCache:
     def __init__(self):
-        self._store: dict[str, tuple[float, object]] = {}
+        self._slots: list[dict] = []
+        self._expires_at: float = 0.0  # monotonic
 
-    def get(self, key: str, max_age_s: float) -> Optional[object]:
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        ts, value = entry
-        if time.monotonic() - ts > max_age_s:
-            return None
-        return value
+    def is_valid(self) -> bool:
+        return bool(self._slots) and time.monotonic() < self._expires_at
 
-    def set(self, key: str, value: object):
-        self._store[key] = (time.monotonic(), value)
+    def store(self, slots: list[dict]) -> None:
+        self._slots = slots
+        self._expires_at = time.monotonic() + self._ttl_seconds(slots)
 
-    def invalidate(self, key: str):
-        self._store.pop(key, None)
+    def _ttl_seconds(self, slots: list[dict]) -> float:
+        now_fi = datetime.now(FINNISH_TZ)
+        today = now_fi.date()
+        tomorrow = today + timedelta(days=1)
+
+        dates_in_data = {datetime.fromisoformat(s["datetime"]).date() for s in slots}
+
+        if tomorrow in dates_in_data:
+            # Have tomorrow's data — valid until midnight after tomorrow
+            midnight = datetime.combine(tomorrow + timedelta(days=1), datetime.min.time(), tzinfo=FINNISH_TZ)
+        elif now_fi.hour >= TOMORROW_POLL_AFTER_HOUR:
+            # After 14:xx — poll every 15 min waiting for tomorrow's prices
+            return float(TOMORROW_POLL_INTERVAL_S)
+        else:
+            # Before 14:xx — valid until midnight tonight
+            midnight = datetime.combine(tomorrow, datetime.min.time(), tzinfo=FINNISH_TZ)
+
+        return max((midnight - now_fi).total_seconds(), 0.0)
+
+    def get_slots_for_date(self, d: date) -> list[dict]:
+        return [s for s in self._slots if datetime.fromisoformat(s["datetime"]).date() == d]
+
+    def get_current_slot(self) -> Optional[dict]:
+        now_fi = datetime.now(FINNISH_TZ)
+        # Build prefix matching current quarter-hour: "YYYY-MM-DDTHH:MM"
+        minute_q = (now_fi.minute // 15) * 15
+        prefix = now_fi.strftime(f"%Y-%m-%dT%H:{minute_q:02d}")
+        for s in self._slots:
+            if s["datetime"].startswith(prefix):
+                return s
+        return None
+
+    def has_tomorrow(self) -> bool:
+        tomorrow = (datetime.now(FINNISH_TZ) + timedelta(days=1)).date()
+        return any(datetime.fromisoformat(s["datetime"]).date() == tomorrow for s in self._slots)
 
 
-cache = Cache()
+price_cache = PriceCache()
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -71,12 +109,24 @@ async def fetch_json(path: str) -> object:
         return resp.json()
 
 
-def seconds_until_next_quarter() -> float:
-    """Seconds until the next :00, :15, :30, or :45 boundary."""
-    now = datetime.now()
-    minutes = now.minute % 15
-    seconds = now.second
-    return (15 - minutes) * 60 - seconds
+def _parse_slots(raw: list) -> list[dict]:
+    return [
+        {
+            "rank": entry["Rank"],
+            "datetime": entry["DateTime"],
+            "price_no_tax_eur_kwh": entry["PriceNoTax"],
+            "price_with_tax_eur_kwh": entry["PriceWithTax"],
+        }
+        for entry in raw
+    ]
+
+
+async def ensure_cache() -> None:
+    """Populate the cache if empty or expired."""
+    if price_cache.is_valid():
+        return
+    raw = await fetch_json("/TodayAndDayForward")
+    price_cache.store(_parse_slots(raw))
 
 
 # ---------------------------------------------------------------------------
@@ -89,58 +139,57 @@ mcp = FastMCP(
         "Provides Finnish electricity spot prices from api.spot-hinta.fi. "
         "Prices are in EUR/kWh. Rank is a 1-96 percentile within today's prices "
         "(1 = cheapest quarter-hour, 96 = most expensive). "
-        "All timestamps are in Finnish local time (EET/EEST, UTC+2/UTC+3)."
+        "All timestamps are in Finnish local time (EET/EEST, UTC+2/UTC+3). "
+        "Days may have 23, 24, or 25 hours due to DST transitions."
     ),
 )
 
 
 @mcp.tool(description=(
     "Get the current electricity spot price (this quarter-hour). "
-    "Returns Rank (1=cheapest, 96=most expensive), DateTime, "
-    "PriceNoTax and PriceWithTax in EUR/kWh. Cached for 60 seconds."
+    "Returns rank (1=cheapest, 96=most expensive), datetime, "
+    "price_no_tax_eur_kwh and price_with_tax_eur_kwh. Served from local cache."
 ))
 async def get_current_price() -> dict:
-    cached = cache.get("justnow", max_age_s=60)
-    if cached is not None:
-        return cached
-
-    data = await fetch_json("/JustNow")
-    result = {
-        "rank": data["Rank"],
-        "datetime": data["DateTime"],
-        "price_no_tax_eur_kwh": data["PriceNoTax"],
-        "price_with_tax_eur_kwh": data["PriceWithTax"],
-        "cached": False,
-    }
-    cache.set("justnow", result)
-    return result
+    await ensure_cache()
+    slot = price_cache.get_current_slot()
+    if slot is None:
+        return {"error": "Current quarter-hour slot not found in cached data"}
+    return slot
 
 
 @mcp.tool(description=(
-    "Get all electricity spot prices for today as a list of 96 quarter-hour slots. "
+    "Get all electricity spot prices for today as a list of quarter-hour slots. "
     "Each entry has rank, datetime, price_no_tax_eur_kwh, price_with_tax_eur_kwh. "
     "Useful for planning: finding cheap/expensive windows, computing averages, "
-    "identifying best hours for pre-heating etc. "
-    "Cache refreshes at each quarter-hour boundary."
+    "identifying best hours for pre-heating etc."
 ))
 async def get_today_prices() -> dict:
-    ttl = seconds_until_next_quarter()
-    cached = cache.get("today", max_age_s=ttl)
-    if cached is not None:
-        return {"slots": cached, "cached": True, "count": len(cached)}
+    await ensure_cache()
+    today = datetime.now(FINNISH_TZ).date()
+    slots = price_cache.get_slots_for_date(today)
+    return {"slots": slots, "count": len(slots)}
 
-    raw = await fetch_json("/Today")
-    slots = [
-        {
-            "rank": entry["Rank"],
-            "datetime": entry["DateTime"],
-            "price_no_tax_eur_kwh": entry["PriceNoTax"],
-            "price_with_tax_eur_kwh": entry["PriceWithTax"],
+
+@mcp.tool(description=(
+    "Get all electricity spot prices for tomorrow. "
+    "Prices are published by Nord Pool around 14:15 Finnish time, at latest 16:00. "
+    "Returns slots with rank, datetime, price_no_tax_eur_kwh, price_with_tax_eur_kwh, "
+    "or available=false if tomorrow's prices are not yet published."
+))
+async def get_tomorrow_prices() -> dict:
+    await ensure_cache()
+    tomorrow = (datetime.now(FINNISH_TZ) + timedelta(days=1)).date()
+    slots = price_cache.get_slots_for_date(tomorrow)
+    if not slots:
+        return {
+            "available": False,
+            "message": (
+                "Tomorrow's prices are not yet published. "
+                "They are typically available after 14:15 Finnish time."
+            ),
         }
-        for entry in raw
-    ]
-    cache.set("today", slots)
-    return {"slots": slots, "cached": False, "count": len(slots)}
+    return {"available": True, "slots": slots, "count": len(slots)}
 
 
 @mcp.tool(description=(
@@ -156,15 +205,14 @@ async def get_prices_for_hours(hour_from: int, hour_to: int) -> dict:
     if hour_from > hour_to:
         return {"error": "hour_from must be <= hour_to"}
 
-    all_data = await get_today_prices()
-    slots = all_data["slots"]
+    await ensure_cache()
+    today = datetime.now(FINNISH_TZ).date()
+    slots = price_cache.get_slots_for_date(today)
 
-    filtered = []
-    for s in slots:
-        dt = datetime.fromisoformat(s["datetime"])
-        if hour_from <= dt.hour <= hour_to:
-            filtered.append(s)
-
+    filtered = [
+        s for s in slots
+        if hour_from <= datetime.fromisoformat(s["datetime"]).hour <= hour_to
+    ]
     if not filtered:
         return {"slots": [], "count": 0, "summary": None}
 
@@ -191,30 +239,38 @@ async def get_prices_for_hours(hour_from: int, hour_to: int) -> dict:
     "Returns slots sorted by price ascending, with their datetimes."
 ))
 async def get_cheapest_remaining_slots(n: int = 4) -> dict:
-    all_data = await get_today_prices()
-    slots = all_data["slots"]
+    await ensure_cache()
+    today = datetime.now(FINNISH_TZ).date()
+    slots = price_cache.get_slots_for_date(today)
 
-    now_prefix = datetime.now().astimezone().isoformat()[:16]
+    now_fi = datetime.now(FINNISH_TZ)
+    minute_q = (now_fi.minute // 15) * 15
+    now_prefix = now_fi.strftime(f"%Y-%m-%dT%H:{minute_q:02d}")
+
     remaining = [s for s in slots if s["datetime"][:16] >= now_prefix]
     sorted_slots = sorted(remaining, key=lambda s: s["price_with_tax_eur_kwh"])
-    top_n = sorted_slots[:n]
 
     return {
         "requested_n": n,
         "available_remaining_slots": len(remaining),
-        "cheapest_slots": top_n,
+        "cheapest_slots": sorted_slots[:n],
     }
 
 
 @mcp.tool(description=(
-    "Summarise today's price distribution: cheapest hour, most expensive hour, "
+    "Summarise today's price distribution: cheapest slot, most expensive slot, "
     "average price, and how the current price compares to today's range. "
+    "Also indicates whether tomorrow's prices are already available. "
     "Good for a quick sanity check or agent reasoning context."
 ))
 async def get_today_summary() -> dict:
-    current = await get_current_price()
-    all_data = await get_today_prices()
-    slots = all_data["slots"]
+    await ensure_cache()
+    today = datetime.now(FINNISH_TZ).date()
+    slots = price_cache.get_slots_for_date(today)
+    current = price_cache.get_current_slot()
+
+    if not slots or current is None:
+        return {"error": "Price data unavailable"}
 
     prices = [s["price_with_tax_eur_kwh"] for s in slots]
     cheapest = min(slots, key=lambda s: s["price_with_tax_eur_kwh"])
@@ -225,7 +281,7 @@ async def get_today_summary() -> dict:
     price_range = most_expensive["price_with_tax_eur_kwh"] - cheapest["price_with_tax_eur_kwh"]
     pct_in_range = (
         round((current_price - cheapest["price_with_tax_eur_kwh"]) / price_range * 100, 1)
-        if price_range > 0 else 0
+        if price_range > 0 else 0.0
     )
 
     return {
@@ -248,6 +304,7 @@ async def get_today_summary() -> dict:
             "cheapest_slot": cheapest,
             "most_expensive_slot": most_expensive,
             "total_slots": len(slots),
+            "tomorrow_prices_available": price_cache.has_tomorrow(),
         },
     }
 
