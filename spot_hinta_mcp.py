@@ -10,7 +10,6 @@ Endpoints used:
 Cache strategy:
   - JustNow: cached for 60 seconds
   - Today:   cached until next quarter-hour boundary (refreshed at :00, :15, :30, :45)
-  - tomorrow's prices available from ~13:00 EET — fetched on demand, cached for 1 hour
 
 Run:
   python spot_hinta_mcp.py
@@ -22,7 +21,7 @@ MCP endpoint: http://localhost:8765/mcp  (Streamable HTTP)
 import asyncio
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from typing import Optional
 
 import httpx
@@ -114,7 +113,6 @@ async def get_current_price() -> dict:
         "cached": False,
     }
     cache.set("justnow", result)
-    result = dict(result)  # copy so cached version stays clean
     return result
 
 
@@ -196,13 +194,8 @@ async def get_cheapest_remaining_slots(n: int = 4) -> dict:
     all_data = await get_today_prices()
     slots = all_data["slots"]
 
-    now_iso = datetime.now().astimezone().isoformat()
-    # Filter to slots in the future (or current quarter)
-    remaining = [
-        s for s in slots
-        if s["datetime"] >= now_iso[:16]  # compare YYYY-MM-DDTHH:MM prefix
-    ]
-
+    now_prefix = datetime.now().astimezone().isoformat()[:16]
+    remaining = [s for s in slots if s["datetime"][:16] >= now_prefix]
     sorted_slots = sorted(remaining, key=lambda s: s["price_with_tax_eur_kwh"])
     top_n = sorted_slots[:n]
 
@@ -266,4 +259,10 @@ async def get_today_summary() -> dict:
 if __name__ == "__main__":
     print(f"Starting spot-hinta MCP server on port {PORT}")
     print(f"MCP endpoint: http://localhost:{PORT}/mcp")
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=PORT, path="/mcp")
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=PORT,
+        path="/mcp",
+        log_level="debug",
+    )
