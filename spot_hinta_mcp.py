@@ -40,7 +40,8 @@ PORT = int(os.environ.get("SPOT_HINTA_PORT", 8765))
 FINNISH_TZ = ZoneInfo("Europe/Helsinki")
 
 # Tomorrow's prices are published around 14:15, at latest ~16:00
-TOMORROW_POLL_AFTER_HOUR = 14
+TOMORROW_POLL_AFTER_HOUR = 14    # )
+TOMORROW_POLL_AFTER_MINUTE = 15  # ) prices published after ~14:15
 TOMORROW_POLL_INTERVAL_S = 15 * 60  # re-check every 15 min after 14:xx
 
 # ---------------------------------------------------------------------------
@@ -60,7 +61,7 @@ class PriceCache:
         self._expires_at = time.monotonic() + self._ttl_seconds(slots)
 
     def _ttl_seconds(self, slots: list[dict]) -> float:
-        now_fi = datetime.now(FINNISH_TZ)
+        now_fi = _now_fi()
         today = now_fi.date()
         tomorrow = today + timedelta(days=1)
 
@@ -69,7 +70,7 @@ class PriceCache:
         if tomorrow in dates_in_data:
             # Have tomorrow's data — valid until midnight after tomorrow
             midnight = datetime.combine(tomorrow + timedelta(days=1), datetime.min.time(), tzinfo=FINNISH_TZ)
-        elif now_fi.hour >= TOMORROW_POLL_AFTER_HOUR:
+        elif (now_fi.hour, now_fi.minute) >= (TOMORROW_POLL_AFTER_HOUR, TOMORROW_POLL_AFTER_MINUTE):
             # After 14:xx — poll every 15 min waiting for tomorrow's prices
             return float(TOMORROW_POLL_INTERVAL_S)
         else:
@@ -82,7 +83,7 @@ class PriceCache:
         return [s for s in self._slots if datetime.fromisoformat(s["datetime"]).date() == d]
 
     def get_current_slot(self) -> Optional[dict]:
-        now_fi = datetime.now(FINNISH_TZ)
+        now_fi = _now_fi()
         # Build prefix matching current quarter-hour: "YYYY-MM-DDTHH:MM"
         minute_q = (now_fi.minute // 15) * 15
         prefix = now_fi.strftime(f"%Y-%m-%dT%H:{minute_q:02d}")
@@ -92,7 +93,7 @@ class PriceCache:
         return None
 
     def has_tomorrow(self) -> bool:
-        tomorrow = (datetime.now(FINNISH_TZ) + timedelta(days=1)).date()
+        tomorrow = (_now_fi() + timedelta(days=1)).date()
         return any(datetime.fromisoformat(s["datetime"]).date() == tomorrow for s in self._slots)
 
 
@@ -101,6 +102,11 @@ price_cache = PriceCache()
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
+
+def _now_fi() -> datetime:
+    """Return current Finnish local time. Extracted for testability."""
+    return datetime.now(FINNISH_TZ)
+
 
 async def fetch_json(path: str) -> object:
     async with httpx.AsyncClient(timeout=10) as client:
@@ -166,7 +172,7 @@ async def get_current_price() -> dict:
 ))
 async def get_today_prices() -> dict:
     await ensure_cache()
-    today = datetime.now(FINNISH_TZ).date()
+    today = _now_fi().date()
     slots = price_cache.get_slots_for_date(today)
     return {"slots": slots, "count": len(slots)}
 
@@ -179,7 +185,7 @@ async def get_today_prices() -> dict:
 ))
 async def get_tomorrow_prices() -> dict:
     await ensure_cache()
-    tomorrow = (datetime.now(FINNISH_TZ) + timedelta(days=1)).date()
+    tomorrow = (_now_fi() + timedelta(days=1)).date()
     slots = price_cache.get_slots_for_date(tomorrow)
     if not slots:
         return {
@@ -206,7 +212,7 @@ async def get_prices_for_hours(hour_from: int, hour_to: int) -> dict:
         return {"error": "hour_from must be <= hour_to"}
 
     await ensure_cache()
-    today = datetime.now(FINNISH_TZ).date()
+    today = _now_fi().date()
     slots = price_cache.get_slots_for_date(today)
 
     filtered = [
@@ -240,10 +246,10 @@ async def get_prices_for_hours(hour_from: int, hour_to: int) -> dict:
 ))
 async def get_cheapest_remaining_slots(n: int = 4) -> dict:
     await ensure_cache()
-    today = datetime.now(FINNISH_TZ).date()
+    today = _now_fi().date()
     slots = price_cache.get_slots_for_date(today)
 
-    now_fi = datetime.now(FINNISH_TZ)
+    now_fi = _now_fi()
     minute_q = (now_fi.minute // 15) * 15
     now_prefix = now_fi.strftime(f"%Y-%m-%dT%H:{minute_q:02d}")
 
@@ -265,7 +271,7 @@ async def get_cheapest_remaining_slots(n: int = 4) -> dict:
 ))
 async def get_today_summary() -> dict:
     await ensure_cache()
-    today = datetime.now(FINNISH_TZ).date()
+    today = _now_fi().date()
     slots = price_cache.get_slots_for_date(today)
     current = price_cache.get_current_slot()
 
