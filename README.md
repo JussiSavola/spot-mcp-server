@@ -2,7 +2,7 @@
 
 MCP server for Finnish electricity spot prices, powered by [api.spot-hinta.fi](https://api.spot-hinta.fi).
 
-Exposes real-time and today's quarter-hour spot price data as MCP tools, making electricity prices available to AI agents and LLM-based automations without requiring them to call external APIs directly.
+Exposes real-time and forward-looking spot price data as MCP tools, making electricity prices available to AI agents and LLM-based automations without requiring them to call external APIs directly.
 
 ## Background
 
@@ -14,19 +14,31 @@ This server fills the gap: a lightweight MCP endpoint that any MCP-compatible AI
 
 | Tool | Description |
 |------|-------------|
-| `get_current_price` | Current quarter-hour: rank, price with/without tax. Cached 60 s. |
-| `get_today_prices` | All 96 quarter-hour slots for today. Cache refreshes at each :00/:15/:30/:45 boundary. |
+| `get_current_price` | Current quarter-hour: rank, price with/without tax. Served from cache. |
+| `get_today_prices` | All quarter-hour slots for today. |
+| `get_tomorrow_prices` | All quarter-hour slots for tomorrow, if published (~14:15 Finnish time). |
 | `get_prices_for_hours(hour_from, hour_to)` | Filtered time window with min/max/avg summary and cheapest/most expensive slot. |
 | `get_cheapest_remaining_slots(n)` | Top N cheapest slots remaining today, sorted by price. |
-| `get_today_summary` | Current price context: rank, assessment (very cheap → very expensive), position in today's range. |
+| `get_today_summary` | Current price context: rank, assessment (very cheap → very expensive), position in today's range, tomorrow availability. |
 
-Prices are in EUR/kWh. **Rank** is a 1–96 percentile within today's prices (1 = cheapest quarter-hour, 96 = most expensive).
+Prices are in EUR/kWh. **Rank** is a 1–96 percentile within today's prices (1 = cheapest quarter-hour, 96 = most expensive). Days may have 23, 24, or 25 slots per hour due to DST transitions.
+
+## Cache strategy
+
+A single `/TodayAndDayForward` fetch populates all data. Prices are static once published; cache expires only when new data can appear:
+
+- Tomorrow's data present → expires at midnight after tomorrow
+- Only today's data, before 14:15 → expires at midnight tonight
+- Only today's data, after 14:15 → expires in 15 min (lazy poll until tomorrow is published)
+
+Current price is derived from the cache by matching the current quarter-hour slot — no separate `/JustNow` call is made.
 
 ## Requirements
 
 - Python 3.10+
 - `fastmcp`
 - `httpx`
+- `tzdata`
 
 ## Installation
 
@@ -73,10 +85,19 @@ Add to your Claude MCP configuration:
 }
 ```
 
+## Tests
+
+```bash
+pip install pytest
+pytest test_spot_hinta.py -v
+```
+
+Tests cover cache TTL logic, quarter-hour slot matching, DST transition handling, and data parsing. Network calls are mocked.
+
 ## Data source
 
-[api.spot-hinta.fi](https://api.spot-hinta.fi) — free Finnish electricity spot price API.  
-Endpoints used: `/JustNow`, `/Today`.
+[api.spot-hinta.fi](https://api.spot-hinta.fi) — free Finnish electricity spot price API.
+Endpoint used: `/TodayAndDayForward`.
 
 ## License
 
