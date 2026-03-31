@@ -1,3 +1,6 @@
 fastmcp
 httpx
 tzdata
+pyyaml
+pytest
+freezegun

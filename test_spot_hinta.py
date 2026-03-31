@@ -197,13 +197,13 @@ class TestTTLSeconds:
             # (would be 133200s with correct DST; acceptable 1h error once per year)
             assert ttl == pytest.approx(136800, abs=60)
 
-    def test_only_today_before_1415_expires_at_midnight(self):
+    def test_only_today_before_1415_expires_at_1415(self):
         with patch_now("2026-03-28 10:00:00"):
             cache = PriceCache()
             slots = make_slots(RAW_TODAY)
             ttl = cache._ttl_seconds(slots)
-            # 10:00 EET → midnight = 14h = 50400s
-            assert ttl == pytest.approx(50400, abs=60)
+            # 10:00 EET → 14:15 = 4h15m = 15300s
+            assert ttl == pytest.approx(15300, abs=60)
 
     def test_only_today_after_1415_expires_in_15_minutes(self):
         with patch_now("2026-03-28 15:00:00"):
@@ -212,13 +212,13 @@ class TestTTLSeconds:
             ttl = cache._ttl_seconds(slots)
             assert ttl == 15 * 60
 
-    def test_just_before_1415_still_uses_midnight_ttl(self):
+    def test_just_before_1415_expires_in_one_second(self):
         with patch_now("2026-03-28 14:14:59"):
             cache = PriceCache()
             slots = make_slots(RAW_TODAY)
             ttl = cache._ttl_seconds(slots)
-            # 9h 45m 1s to midnight > 15 min
-            assert ttl > 15 * 60
+            # 1 second until 14:15
+            assert ttl == pytest.approx(1, abs=1)
 
     def test_exactly_1415_uses_poll_ttl(self):
         with patch_now("2026-03-28 14:15:00"):

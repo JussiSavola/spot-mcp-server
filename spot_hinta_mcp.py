@@ -10,7 +10,7 @@ Cache strategy:
   - A single /TodayAndDayForward call populates all data.
   - Prices are static once published; cache expires only when new data can appear:
       * Tomorrow's data present  -> expire at midnight after tomorrow
-      * Only today, time < 14:15 -> expire at midnight tonight
+      * Only today, time < 14:15 -> expire at 14:15 today (when tomorrow's prices first appear)
       * Only today, time >= 14:15 -> expire in 15 min (lazy poll until tomorrow published)
   - Current price is derived from cache by matching the current quarter-hour slot.
     No /JustNow calls are made.
@@ -74,8 +74,12 @@ class PriceCache:
             # After 14:xx — poll every 15 min waiting for tomorrow's prices
             return float(TOMORROW_POLL_INTERVAL_S)
         else:
-            # Before 14:xx — valid until midnight tonight
-            midnight = datetime.combine(tomorrow, datetime.min.time(), tzinfo=FINNISH_TZ)
+            # Before 14:xx — cache until exactly 14:15 today, the earliest tomorrow's
+            # prices can appear; no point expiring later since data won't change before then
+            midnight = now_fi.replace(
+                hour=TOMORROW_POLL_AFTER_HOUR, minute=TOMORROW_POLL_AFTER_MINUTE,
+                second=0, microsecond=0,
+            )
 
         return max((midnight - now_fi).total_seconds(), 0.0)
 
