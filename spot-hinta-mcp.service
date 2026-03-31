@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=jsavola
-WorkingDirectory=/home/jsavola/gitrepos/spot-mcp-server
-ExecStart=/usr/bin/python3 /home/jsavola/gitrepos/spot-mcp-server/spot_hinta_mcp.py
+User=username
+WorkingDirectory=/home/username/gitrepos/spot-mcp-server
+ExecStart=/usr/bin/python3 /home/username/gitrepos/spot-mcp-server/spot_hinta_mcp.py
 Environment=SPOT_HINTA_PORT=8767
 Restart=on-failure
 RestartSec=10
